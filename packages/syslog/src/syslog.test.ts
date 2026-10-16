@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { LogRecord, Sink } from "@logtape/logtape";
 import { createSocket } from "node:dgram";
-import { createServer } from "node:net";
+import { createServer, Socket } from "node:net";
+import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   DenoTcpSyslogConnection,
@@ -1887,3 +1888,133 @@ test("getSyslogSink() renders circular message values", async () => {
     server.close();
   }
 });
+
+// Node.js-specific recovery tests
+if (typeof Deno === "undefined") {
+  async function waitFor(check: () => boolean): Promise<void> {
+    for (let i = 0; i < 100 && !check(); i++) await delay(20);
+  }
+
+  async function getFreePort(): Promise<number> {
+    const server = createServer();
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve)
+    );
+    const { port } = server.address() as { port: number };
+    await new Promise((resolve) => server.close(resolve));
+    return port;
+  }
+
+  test("getSyslogSink() recovers once the TCP server becomes reachable (Node.js)", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    const port = await getFreePort();
+    const sink = getSyslogSink({
+      hostname: "127.0.0.1",
+      port,
+      protocol: "tcp",
+      timeout: 500,
+    });
+
+    let received = "";
+    const server = createServer((socket) => {
+      socket.on("data", (data) => (received += data.toString()));
+    });
+    try {
+      // Nothing is listening yet
+      sink(createMockLogRecord("info", ["lost 1"]));
+      sink(createMockLogRecord("info", ["lost 2"]));
+      await delay(200);
+
+      await new Promise<void>((resolve) =>
+        server.listen(port, "127.0.0.1", resolve)
+      );
+
+      sink(createMockLogRecord("info", ["delivered"]));
+      await waitFor(() => received.includes("delivered"));
+
+      assert.ok(received.includes("delivered"));
+      assert.ok(!received.includes("lost"));
+      assert.deepStrictEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await sink[Symbol.asyncDispose]();
+      server.close();
+    }
+  });
+
+  test("getSyslogSink() drops records queued before a failure (Node.js)", async () => {
+    // Count the connection attempts
+    let connects = 0;
+    const originalConnect = Socket.prototype.connect;
+    Socket.prototype.connect = function (
+      this: Socket,
+      ...args: Parameters<Socket["connect"]>
+    ) {
+      connects++;
+      return originalConnect.apply(this, args);
+    } as Socket["connect"];
+
+    const port = await getFreePort();
+    const sink = getSyslogSink({
+      hostname: "127.0.0.1",
+      port,
+      protocol: "tcp",
+      timeout: 500,
+    });
+    try {
+      // Nothing is listening, and these are all queued behind the first
+      // connection attempt
+      for (let i = 0; i < 10; i++) {
+        sink(createMockLogRecord("info", [`lost ${i}`]));
+      }
+      await delay(200);
+      assert.strictEqual(connects, 1);
+
+      // A record logged after the failure tries again
+      sink(createMockLogRecord("info", ["retry"]));
+      await delay(200);
+      assert.strictEqual(connects, 2);
+    } finally {
+      await sink[Symbol.asyncDispose]();
+      Socket.prototype.connect = originalConnect;
+    }
+  });
+
+  test("getSyslogSink() reconnects after the TCP server drops the connection (Node.js)", async () => {
+    let received = "";
+    const connections = new Set<Socket>();
+    const server = createServer((socket) => {
+      connections.add(socket);
+      socket.on("data", (data) => (received += data.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve)
+    );
+    const { port } = server.address() as { port: number };
+
+    const sink = getSyslogSink({
+      hostname: "127.0.0.1",
+      port,
+      protocol: "tcp",
+      timeout: 500,
+    });
+    try {
+      sink(createMockLogRecord("info", ["first"]));
+      await waitFor(() => received.includes("first"));
+
+      for (const socket of connections) socket.destroy();
+      await delay(100);
+
+      sink(createMockLogRecord("info", ["second"]));
+      await waitFor(() => received.includes("second"));
+
+      assert.ok(received.includes("second"));
+    } finally {
+      await sink[Symbol.asyncDispose]();
+      server.close();
+    }
+  });
+}

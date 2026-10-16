@@ -1,4 +1,9 @@
-import type { LogLevel, LogRecord, Sink } from "@logtape/logtape";
+import {
+  getLogger,
+  type LogLevel,
+  type LogRecord,
+  type Sink,
+} from "@logtape/logtape";
 import { createSocket } from "node:dgram";
 import { Socket } from "node:net";
 import { hostname } from "node:os";
@@ -697,7 +702,14 @@ export class NodeTcpSyslogConnection implements SyslogConnection {
 
         socket.on("error", (error) => {
           clearTimeout(timeout);
+          socket.destroy();
           reject(error);
+        });
+
+        // Forget the connection once it closes (such as when the server drops
+        // it), so that the next send reconnects rather than writing to it
+        socket.on("close", () => {
+          if (this.connection === socket) this.connection = undefined;
         });
 
         // For non-TLS sockets, explicitly call connect
@@ -890,28 +902,59 @@ export function getSyslogSink(
   })();
 
   let isConnected = false;
+  let isFailing = false;
+  let failures = 0;
   let lastPromise = Promise.resolve();
+  // Unlike lastPromise, this never rejects, so that a failure to send one
+  // record doesn't stop every later record from being sent
+  let queue = Promise.resolve();
 
   const sink: Sink & AsyncDisposable = (record: LogRecord) => {
     const syslogMessage = formatSyslogMessage(record, formatOptions);
+    const failuresWhenQueued = failures;
 
-    lastPromise = lastPromise
-      .then(async () => {
-        if (!isConnected) {
-          await connection.connect();
-          isConnected = true;
+    lastPromise = queue.then(async () => {
+      // Drop records that were queued before a failure, rather than trying to
+      // connect again for each of them.  Otherwise, while the server can't be
+      // reached, records are sent at most one per timeout, and those queued
+      // during an outage are sent long after they were logged.
+      if (failures !== failuresWhenQueued) return;
+      if (isConnected) {
+        try {
+          await connection.send(syslogMessage);
+          isFailing = false;
+          return;
+        } catch {
+          // The server may have dropped the connection, so reconnect and try
+          // once more
+          connection.close();
+          isConnected = false;
         }
-        await connection.send(syslogMessage);
-      })
-      .catch((error) => {
-        // If connection fails, try to reconnect on next message
-        isConnected = false;
-        throw error;
-      });
+      }
+      await connection.connect();
+      isConnected = true;
+      await connection.send(syslogMessage);
+      isFailing = false;
+    });
+    queue = lastPromise.catch((error) => {
+      failures++;
+      // Try to reconnect on the next record
+      isConnected = false;
+      connection.close();
+      // Report only the first failure until a record is sent again, rather
+      // than one for every record
+      if (!isFailing) {
+        isFailing = true;
+        getLogger(["logtape", "meta", "syslog"]).error(
+          "Failed to send a log record to the syslog server: {error}",
+          { error },
+        );
+      }
+    });
   };
 
   sink[asyncDisposeSymbol] = async () => {
-    await lastPromise.catch(() => {}); // Wait for any pending operations
+    await queue; // Wait for any pending operations
     connection.close();
     isConnected = false;
   };
