@@ -2018,3 +2018,75 @@ if (typeof Deno === "undefined") {
     }
   });
 }
+
+// Node.js-specific buffering tests
+if (typeof Deno === "undefined") {
+  async function listen(): Promise<{
+    server: ReturnType<typeof createServer>;
+    port: number;
+    received: () => string;
+  }> {
+    let received = "";
+    const server = createServer((socket) => {
+      socket.on("data", (data) => (received += data.toString()));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve)
+    );
+    const { port } = server.address() as { port: number };
+    return { server, port, received: () => received };
+  }
+
+  async function waitUntil(check: () => boolean): Promise<void> {
+    for (let i = 0; i < 100 && !check(); i++) await delay(20);
+  }
+
+  test("getSyslogSink() drops the oldest records once maxBufferedBytes is reached (Node.js)", async () => {
+    const { server, port, received } = await listen();
+
+    // Each message is around 80 bytes, so only the newest few fit
+    const sink = getSyslogSink({
+      hostname: "127.0.0.1",
+      port,
+      protocol: "tcp",
+      maxBufferedBytes: 200,
+    });
+    try {
+      // The first record is sent straight away, and the rest wait for the
+      // connection to be made
+      for (let i = 0; i < 10; i++) {
+        sink(createMockLogRecord("info", [`record-${i}`]));
+      }
+      await waitUntil(() => received().includes("record-9"));
+
+      assert.ok(received().includes("record-0"));
+      assert.ok(!received().includes("record-1\n"));
+      assert.ok(received().includes("record-9"));
+    } finally {
+      await sink[Symbol.asyncDispose]();
+      server.close();
+    }
+  });
+
+  test("getSyslogSink() drops a record larger than maxBufferedBytes (Node.js)", async () => {
+    const { server, port, received } = await listen();
+
+    const sink = getSyslogSink({
+      hostname: "127.0.0.1",
+      port,
+      protocol: "tcp",
+      maxBufferedBytes: 200,
+    });
+    try {
+      sink(createMockLogRecord("info", ["x".repeat(300)]));
+      sink(createMockLogRecord("info", ["after"]));
+      await waitUntil(() => received().includes("after"));
+
+      assert.ok(received().includes("after"));
+      assert.ok(!received().includes("xxx"));
+    } finally {
+      await sink[Symbol.asyncDispose]();
+      server.close();
+    }
+  });
+}

@@ -153,6 +153,40 @@ outside the application, such a record can be forged at will.
 [RFC 6587]: https://tools.ietf.org/html/rfc6587
 
 
+Limiting buffered records
+-------------------------
+
+*This API is available since LogTape 2.5.0.*
+
+Records are sent one at a time, so while the syslog server is slow to accept
+them, the records waiting to be sent are held in memory.  To put a limit on
+this, set the `~SyslogSinkOptions.maxBufferedBytes` option to the most bytes of
+formatted messages that may be waiting at once.  When a record would go over
+that limit, the oldest records waiting are dropped to make room, as the newest
+records are usually the most useful, and a warning is logged to the meta
+logger:
+
+~~~~ typescript twoslash
+import { configure } from "@logtape/logtape";
+import { getSyslogSink } from "@logtape/syslog";
+
+await configure({
+  sinks: {
+    syslog: getSyslogSink({
+      hostname: "syslog.example.com",
+      protocol: "tcp",
+      maxBufferedBytes: 1024 * 1024, // 1 MiB
+    }),
+  },
+  loggers: [
+    { category: [], sinks: ["syslog"], lowestLevel: "info" },
+  ],
+});
+~~~~
+
+By default, there is no limit.
+
+
 Supported facilities
 --------------------
 

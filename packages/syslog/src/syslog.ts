@@ -183,6 +183,16 @@ export interface SyslogSinkOptions {
   readonly timeout?: number;
 
   /**
+   * The maximum total size, in bytes, of the formatted messages waiting to be
+   * sent.  When a record would take it over this, the oldest records waiting
+   * are dropped to make room, and a warning is logged to the meta logger.  This
+   * bounds memory use when the syslog server is slow to accept records.
+   * @default `Infinity`
+   * @since 2.5.0
+   */
+  readonly maxBufferedBytes?: number;
+
+  /**
    * Whether to include structured data in syslog messages.
    * @default `false`
    */
@@ -862,6 +872,7 @@ export function getSyslogSink(
   const syslogHostname = options.syslogHostname ?? getSystemHostname();
   const processId = options.processId ?? getProcessId();
   const timeout = options.timeout ?? 5000;
+  const maxBufferedBytes = options.maxBufferedBytes ?? Infinity;
   const includeStructuredData = options.includeStructuredData ?? false;
   const structuredDataId = options.structuredDataId ?? "logtape@32473";
 
@@ -901,60 +912,117 @@ export function getSyslogSink(
     }
   })();
 
+  interface PendingRecord {
+    readonly message: string;
+    readonly size: number;
+    readonly resolve: () => void;
+    readonly reject: (error: unknown) => void;
+  }
+
   let isConnected = false;
   let isFailing = false;
-  let failures = 0;
+  let isBufferFull = false;
+  // Records waiting to be sent, oldest first
+  const pending: PendingRecord[] = [];
+  let bufferedBytes = 0;
+  let draining: Promise<void> | undefined;
   let lastPromise = Promise.resolve();
-  // Unlike lastPromise, this never rejects, so that a failure to send one
-  // record doesn't stop every later record from being sent
-  let queue = Promise.resolve();
+  const encoder = new TextEncoder();
+  const metaLogger = getLogger(["logtape", "meta", "syslog"]);
 
-  const sink: Sink & AsyncDisposable = (record: LogRecord) => {
-    const syslogMessage = formatSyslogMessage(record, formatOptions);
-    const failuresWhenQueued = failures;
+  async function send(message: string): Promise<void> {
+    if (isConnected) {
+      try {
+        await connection.send(message);
+        return;
+      } catch {
+        // The server may have dropped the connection, so reconnect and try
+        // once more
+        connection.close();
+        isConnected = false;
+      }
+    }
+    await connection.connect();
+    isConnected = true;
+    await connection.send(message);
+  }
 
-    lastPromise = queue.then(async () => {
-      // Drop records that were queued before a failure, rather than trying to
-      // connect again for each of them.  Otherwise, while the server can't be
-      // reached, records are sent at most one per timeout, and those queued
-      // during an outage are sent long after they were logged.
-      if (failures !== failuresWhenQueued) return;
-      if (isConnected) {
-        try {
-          await connection.send(syslogMessage);
-          isFailing = false;
-          return;
-        } catch {
-          // The server may have dropped the connection, so reconnect and try
-          // once more
-          connection.close();
-          isConnected = false;
+  function dropOldest(): void {
+    const record = pending.shift()!;
+    bufferedBytes -= record.size;
+    record.resolve();
+  }
+
+  async function drain(): Promise<void> {
+    while (pending.length > 0) {
+      const record = pending.shift()!;
+      bufferedBytes -= record.size;
+      try {
+        await send(record.message);
+        isFailing = false;
+        record.resolve();
+      } catch (error) {
+        record.reject(error);
+        // Try to reconnect on the next record
+        isConnected = false;
+        connection.close();
+        // Drop the records that were waiting, rather than trying to connect
+        // again for each of them.  Otherwise, while the server can't be
+        // reached, records are sent at most one per timeout, and those logged
+        // during an outage are sent long after they were logged.
+        while (pending.length > 0) dropOldest();
+        // Report only the first failure until a record is sent again, rather
+        // than one for every record
+        if (!isFailing) {
+          isFailing = true;
+          metaLogger.error(
+            "Failed to send a log record to the syslog server: {error}",
+            { error },
+          );
         }
       }
-      await connection.connect();
-      isConnected = true;
-      await connection.send(syslogMessage);
-      isFailing = false;
+    }
+    isBufferFull = false;
+    draining = undefined;
+  }
+
+  const sink: Sink & AsyncDisposable = (record: LogRecord) => {
+    const message = formatSyslogMessage(record, formatOptions);
+    // Only measure the message when there is a limit to check it against
+    const size = maxBufferedBytes === Infinity
+      ? 0
+      : encoder.encode(message).byteLength;
+
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    lastPromise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
     });
-    queue = lastPromise.catch((error) => {
-      failures++;
-      // Try to reconnect on the next record
-      isConnected = false;
-      connection.close();
-      // Report only the first failure until a record is sent again, rather
-      // than one for every record
-      if (!isFailing) {
-        isFailing = true;
-        getLogger(["logtape", "meta", "syslog"]).error(
-          "Failed to send a log record to the syslog server: {error}",
-          { error },
+    // Failures are reported to the meta logger, so this needn't be handled
+    lastPromise.catch(() => {});
+
+    pending.push({ message, size, resolve, reject });
+    bufferedBytes += size;
+    if (bufferedBytes > maxBufferedBytes) {
+      // Drop the oldest records to make room, as the newest are the most
+      // useful.  This drops the new record too, if it is over the limit alone.
+      while (bufferedBytes > maxBufferedBytes) dropOldest();
+      // Warn once each time the buffer fills, rather than for every record
+      if (!isBufferFull) {
+        isBufferFull = true;
+        metaLogger.warn(
+          "The syslog buffer is full; dropping the oldest log records.",
         );
       }
-    });
+    }
+
+    if (pending.length > 0) draining ??= drain();
   };
 
   sink[asyncDisposeSymbol] = async () => {
-    await queue; // Wait for any pending operations
+    // Wait for any pending operations
+    while (draining !== undefined) await draining;
     connection.close();
     isConnected = false;
   };
